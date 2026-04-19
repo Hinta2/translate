@@ -44,12 +44,17 @@ from pywinauto import Desktop
 # ----------------------------- Configuration ---------------------------------
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-LIVE_CAPTIONS_TITLE_PATTERN = r".*Live captions.*"
+LIVE_CAPTIONS_WINDOW_PATTERNS = (
+    r".*Live captions.*",  # Windows Live Captions
+    r".*Live Caption.*Google Chrome.*",  # Chrome tab/window title variants
+    r".*Google Chrome.*Live Caption.*",
+)
 POLL_INTERVAL_SECONDS = 0.25
 MAX_CHARS_PER_REQUEST = 900
 OVERLAY_ALPHA = 0.65
 FONT = ("Segoe UI", 24, "bold")
 MAX_CACHE_SIZE = 300
+STREAM_MODE = os.getenv("CAPTION_STREAM_MODE", "word")  # "word" or "line"
 
 
 # ----------------------------- Data structures --------------------------------
@@ -86,10 +91,10 @@ class LRUCache:
 
 # ------------------------ Live Captions extraction ----------------------------
 class LiveCaptionsReader:
-    """Reads current text from the Windows Live Captions window via UI Automation."""
+    """Reads current text from a captions window via UI Automation."""
 
-    def __init__(self, title_pattern: str = LIVE_CAPTIONS_TITLE_PATTERN):
-        self.title_pattern = title_pattern
+    def __init__(self, title_patterns: tuple[str, ...] = LIVE_CAPTIONS_WINDOW_PATTERNS):
+        self.title_patterns = title_patterns
 
     @staticmethod
     def _normalize(text: str) -> str:
@@ -103,8 +108,8 @@ class LiveCaptionsReader:
         Returns None when the window is not found.
         """
         try:
-            window = Desktop(backend="uia").window(title_re=self.title_pattern)
-            if not window.exists(timeout=0.2):
+            window = self._find_caption_window()
+            if window is None:
                 return None
 
             texts: list[str] = []
@@ -126,6 +131,14 @@ class LiveCaptionsReader:
             return cleaned or ""
         except Exception:
             return None
+
+    def _find_caption_window(self):
+        desktop = Desktop(backend="uia")
+        for pattern in self.title_patterns:
+            window = desktop.window(title_re=pattern)
+            if window.exists(timeout=0.15):
+                return window
+        return None
 
 
 # ------------------------------ Translator ------------------------------------
@@ -186,6 +199,7 @@ class OverlayApp:
         self.translated_lines = deque(maxlen=7)
         self.sent_segments = deque(maxlen=300)
         self.last_full_text = ""
+        self.last_tokens: list[str] = []
         self.last_warning_time = 0.0
 
         # Translator setup
@@ -307,7 +321,12 @@ class OverlayApp:
             if full_text is None:
                 now = time.time()
                 if now - self.last_warning_time > 5:
-                    self.ui_queue.put(("warning", "Live Captions window not detected. Open Windows Live Captions."))
+                    self.ui_queue.put(
+                        (
+                            "warning",
+                            "Caption window not detected. Open Windows Live Captions or Chrome Live Caption.",
+                        )
+                    )
                     self.last_warning_time = now
                 time.sleep(POLL_INTERVAL_SECONDS)
                 continue
@@ -315,7 +334,15 @@ class OverlayApp:
             new_segment = self._extract_new_segment(self.last_full_text, full_text)
             self.last_full_text = full_text
 
-            if new_segment:
+            if STREAM_MODE == "word":
+                for token in self._extract_new_tokens(full_text):
+                    if token and token not in self.sent_segments:
+                        self.sent_segments.append(token)
+                        try:
+                            self.capture_queue.put_nowait(CaptionEvent(text=token, timestamp=time.time()))
+                        except queue.Full:
+                            pass
+            elif new_segment:
                 segment = new_segment.strip()
                 if segment and segment not in self.sent_segments:
                     self.sent_segments.append(segment)
@@ -356,6 +383,35 @@ class OverlayApp:
                 return current.strip()
             return ""
         return tail
+
+    def _extract_new_tokens(self, current: str) -> list[str]:
+        """
+        Word-by-word extraction mode.
+        Returns only newly appended tokens since the last poll.
+        """
+        if not current:
+            self.last_tokens = []
+            return []
+
+        current_tokens = current.split()
+        if not self.last_tokens:
+            self.last_tokens = current_tokens
+            return current_tokens[-3:] if len(current_tokens) > 3 else current_tokens
+
+        overlap = 0
+        max_k = min(len(self.last_tokens), len(current_tokens), 18)
+        for k in range(max_k, 0, -1):
+            if self.last_tokens[-k:] == current_tokens[:k]:
+                overlap = k
+                break
+
+        new_tokens = current_tokens[overlap:]
+        self.last_tokens = current_tokens
+
+        # Avoid re-sending huge chunks on reflow; only send a small tail.
+        if len(new_tokens) > 8:
+            return new_tokens[-3:]
+        return new_tokens
 
     def _translate_loop(self):
         while not self.stop_event.is_set():
