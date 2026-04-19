@@ -1,8 +1,9 @@
 """
-Windows Live Captions -> Arabic Overlay Translator
+Google Chrome Live Caption -> Arabic Overlay Translator (Windows 10/11)
 
 Features:
-- Reads text from the Windows "Live captions" window using UI Automation (pywinauto).
+- Captures the Google Chrome window and OCRs the lower-center region (where Chrome Live Caption appears).
+- Uses pytesseract + Pillow + mss for OCR capture.
 - Detects newly appearing caption segments and only translates new content.
 - Translates English captions to Arabic using OpenAI API.
 - Displays Arabic text in a draggable, transparent, always-on-top overlay.
@@ -12,7 +13,14 @@ Features:
 - Starts listening automatically on launch.
 
 Requirements:
-    pip install openai pywinauto keyboard pywin32
+    pip install openai keyboard pywin32 pytesseract pillow mss
+
+Important:
+- Install Tesseract OCR on Windows and make sure it is discoverable.
+  Example path:
+    C:\\Program Files\\Tesseract-OCR\\tesseract.exe
+- Optional environment variable to force path:
+    set TESSERACT_CMD=C:\\Program Files\\Tesseract-OCR\\tesseract.exe
 
 Run:
     set OPENAI_API_KEY=your_key_here
@@ -37,19 +45,29 @@ try:
 except Exception:  # optional fallback
     keyboard = None
 
+import mss
+import pytesseract
+import win32gui
 from openai import OpenAI
-from pywinauto import Desktop
+from PIL import Image
 
 
 # ----------------------------- Configuration ---------------------------------
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-LIVE_CAPTIONS_TITLE_PATTERN = r".*Live captions.*"
-POLL_INTERVAL_SECONDS = 0.25
+CHROME_WINDOW_TITLE_KEYWORD = "Google Chrome"
+POLL_INTERVAL_SECONDS = 0.5
 MAX_CHARS_PER_REQUEST = 900
 OVERLAY_ALPHA = 0.65
 FONT = ("Segoe UI", 24, "bold")
 MAX_CACHE_SIZE = 300
+
+# OCR crop region in Chrome window (fractions of width/height)
+# Lower-center area where Live Caption usually appears.
+OCR_CROP_WIDTH_RATIO = 0.72
+OCR_CROP_HEIGHT_RATIO = 0.28
+OCR_CROP_CENTER_X = 0.5
+OCR_CROP_CENTER_Y = 0.82
 
 
 # ----------------------------- Data structures --------------------------------
@@ -84,12 +102,16 @@ class LRUCache:
                 self._store.popitem(last=False)
 
 
-# ------------------------ Live Captions extraction ----------------------------
-class LiveCaptionsReader:
-    """Reads current text from the Windows Live Captions window via UI Automation."""
+# ------------------------ Chrome OCR extraction -------------------------------
+class ChromeLiveCaptionOCRReader:
+    """Reads current caption-like text from Google Chrome window via OCR."""
 
-    def __init__(self, title_pattern: str = LIVE_CAPTIONS_TITLE_PATTERN):
-        self.title_pattern = title_pattern
+    def __init__(self, title_keyword: str = CHROME_WINDOW_TITLE_KEYWORD):
+        self.title_keyword = title_keyword.lower()
+
+        tesseract_cmd = os.getenv("TESSERACT_CMD", "").strip()
+        if tesseract_cmd:
+            pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
 
     @staticmethod
     def _normalize(text: str) -> str:
@@ -97,33 +119,90 @@ class LiveCaptionsReader:
         text = re.sub(r"\s+", " ", text).strip()
         return text
 
+    def _find_chrome_window_rect(self) -> tuple[int, int, int, int] | None:
+        windows: list[tuple[int, str, tuple[int, int, int, int]]] = []
+
+        def enum_handler(hwnd, _):
+            if not win32gui.IsWindowVisible(hwnd):
+                return
+            title = (win32gui.GetWindowText(hwnd) or "").strip()
+            if not title:
+                return
+            if self.title_keyword not in title.lower():
+                return
+            left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+            if right - left < 300 or bottom - top < 200:
+                return
+            windows.append((hwnd, title, (left, top, right, bottom)))
+
+        win32gui.EnumWindows(enum_handler, None)
+
+        if not windows:
+            return None
+
+        try:
+            fg = win32gui.GetForegroundWindow()
+        except Exception:
+            fg = 0
+
+        # Prefer the focused Chrome window; fallback to largest visible one.
+        for hwnd, _title, rect in windows:
+            if hwnd == fg:
+                return rect
+
+        windows.sort(key=lambda item: (item[2][2] - item[2][0]) * (item[2][3] - item[2][1]), reverse=True)
+        return windows[0][2]
+
+    @staticmethod
+    def _crop_live_caption_region(img: Image.Image) -> Image.Image:
+        w, h = img.size
+
+        crop_w = int(w * OCR_CROP_WIDTH_RATIO)
+        crop_h = int(h * OCR_CROP_HEIGHT_RATIO)
+
+        center_x = int(w * OCR_CROP_CENTER_X)
+        center_y = int(h * OCR_CROP_CENTER_Y)
+
+        left = max(0, center_x - crop_w // 2)
+        upper = max(0, center_y - crop_h // 2)
+        right = min(w, left + crop_w)
+        lower = min(h, upper + crop_h)
+
+        return img.crop((left, upper, right, lower))
+
+    @staticmethod
+    def _preprocess_for_ocr(img: Image.Image) -> Image.Image:
+        # Convert to grayscale + increase contrast by thresholding to improve subtitle OCR.
+        gray = img.convert("L")
+        bw = gray.point(lambda x: 255 if x > 140 else 0, mode="1")
+        return bw
+
     def get_current_text(self) -> str | None:
         """
-        Returns full current caption text from the Live Captions window.
-        Returns None when the window is not found.
+        Returns OCR text from lower-center Google Chrome region.
+        Returns None when Chrome window is not found or capture fails.
         """
+        rect = self._find_chrome_window_rect()
+        if not rect:
+            return None
+
+        left, top, right, bottom = rect
+        width = right - left
+        height = bottom - top
+        if width <= 0 or height <= 0:
+            return None
+
+        monitor = {"left": left, "top": top, "width": width, "height": height}
+
         try:
-            window = Desktop(backend="uia").window(title_re=self.title_pattern)
-            if not window.exists(timeout=0.2):
-                return None
-
-            texts: list[str] = []
-
-            # Collect text-like descendants; Live Captions typically exposes Text controls.
-            for ctrl in window.descendants(control_type="Text"):
-                val = ctrl.window_text().strip()
-                if val:
-                    texts.append(val)
-
-            # Fallback in case control types differ.
-            if not texts:
-                for raw in window.texts():
-                    val = raw.strip()
-                    if val:
-                        texts.append(val)
-
-            cleaned = self._normalize(" ".join(dict.fromkeys(texts)))
-            return cleaned or ""
+            with mss.mss() as sct:
+                shot = sct.grab(monitor)
+            img = Image.frombytes("RGB", shot.size, shot.rgb)
+            region = self._crop_live_caption_region(img)
+            prepared = self._preprocess_for_ocr(region)
+            text = pytesseract.image_to_string(prepared, lang="eng", config="--oem 3 --psm 6")
+            cleaned = self._normalize(text)
+            return cleaned
         except Exception:
             return None
 
@@ -180,7 +259,7 @@ class OverlayApp:
         self.ui_queue: queue.Queue[tuple[str, str]] = queue.Queue(maxsize=120)
 
         # Workers / state
-        self.reader = LiveCaptionsReader()
+        self.reader = ChromeLiveCaptionOCRReader()
         self.overlay_visible = True
         self.translation_cache = LRUCache(MAX_CACHE_SIZE)
         self.translated_lines = deque(maxlen=7)
@@ -307,7 +386,7 @@ class OverlayApp:
             if full_text is None:
                 now = time.time()
                 if now - self.last_warning_time > 5:
-                    self.ui_queue.put(("warning", "Live Captions window not detected. Open Windows Live Captions."))
+                    self.ui_queue.put(("warning", "Google Chrome window not detected for OCR."))
                     self.last_warning_time = now
                 time.sleep(POLL_INTERVAL_SECONDS)
                 continue
@@ -337,11 +416,10 @@ class OverlayApp:
         if current.startswith(previous):
             return current[len(previous) :].strip()
 
-        # If captions rolled/reflowed, take unseen tail lines.
+        # If captions rolled/reflowed, take unseen tail tokens.
         prev_tokens = previous.split(" ")
         curr_tokens = current.split(" ")
 
-        # Find longest suffix of previous matching prefix of current.
         overlap = 0
         max_k = min(len(prev_tokens), len(curr_tokens), 22)
         for k in range(max_k, 0, -1):
@@ -351,7 +429,6 @@ class OverlayApp:
 
         tail = " ".join(curr_tokens[overlap:]).strip()
         if tail == current.strip():
-            # No meaningful overlap detected; avoid massive repeat bursts.
             if len(current) < 140:
                 return current.strip()
             return ""
@@ -395,7 +472,6 @@ class OverlayApp:
             if action == "append":
                 self.append_translated_text(payload)
             elif action == "warning":
-                # Show temporary warning in overlay and optional popup when key is missing.
                 if not self.translated_lines:
                     self.text_var.set(payload)
 
@@ -404,7 +480,6 @@ class OverlayApp:
     # ---------------- hotkeys / lifecycle ----------------
     def _register_global_hotkeys(self):
         if keyboard is None:
-            # fallback only (F8/F9 when window focused)
             return
 
         def _safe_register(hotkey: str, callback):
