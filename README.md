@@ -1,42 +1,50 @@
-# Live Captions Arabic Overlay (Windows)
+# Live Caption Overlay (EN Audio -> AR Translation)
 
-This project contains a single Python desktop app that:
+سكريبت Windows جاهز يعرض **Live Caption Overlay** شكله مريح (أسود شفاف) ويترجم أي صوت إنجليزي خارج من الجهاز إلى عربي بشكل لحظي.
 
-- Reads text from **Windows Live Captions** using UI Automation (`pywinauto`)
-- Detects only new caption text segments
-- Translates English captions to Arabic using the OpenAI API (`gpt-4o-mini` by default)
-- Displays translated text in a draggable, transparent, always-on-top overlay
+## Features
+
+- يلتقط صوت النظام بالكامل (System Audio / Speaker Output) عبر WASAPI Loopback.
+- يحول الكلام الإنجليزي إلى نص بسرعة باستخدام Deepgram Realtime.
+- يترجم النص للعربي تلقائيًا ويعرضه على Overlay عائم دائمًا فوق كل النوافذ.
+- Overlay قابل للسحب + تكبير/تصغير سريع.
 
 ## File
 
 - `live_captions_overlay.py`
 
-## Install
+## Requirements
 
 ```bash
-pip install openai pywinauto keyboard pywin32
+pip install sounddevice websockets keyboard deep-translator pywin32
 ```
 
-## Set your API key (required)
+> ملاحظة: السكريبت مخصص لويندوز.
 
-> Do not hardcode API keys in source code. Set it as an environment variable.
+## API Key
 
 ### PowerShell
 
 ```powershell
-$env:OPENAI_API_KEY="your_api_key_here"
+$env:DEEPGRAM_API_KEY="your_deepgram_key_here"
 ```
 
 ### Command Prompt
 
 ```cmd
-set OPENAI_API_KEY=your_api_key_here
+set DEEPGRAM_API_KEY=your_deepgram_key_here
 ```
 
-(Optional) choose a model:
+(اختياري) موديل Deepgram:
 
 ```cmd
-set OPENAI_MODEL=gpt-4o-mini
+set DG_MODEL=nova-2
+```
+
+(اختياري) شفافية النافذة:
+
+```cmd
+set CAPTION_ALPHA=0.72
 ```
 
 ## Run
@@ -47,12 +55,15 @@ python live_captions_overlay.py
 
 ## Controls
 
-- `Ctrl + Shift + T`: toggle overlay visibility
-- `Ctrl + Shift + C`: clear translated text
-- Right-click overlay for menu (clear/toggle/click-through/exit)
+- `Ctrl + Shift + T`: إخفاء/إظهار overlay
+- `Ctrl + Shift + C`: مسح النص
+- `Ctrl + Shift + =`: تكبير
+- `Ctrl + Shift + -`: تصغير
+- `Ctrl + Mouse Wheel`: تكبير/تصغير
+- Right click على overlay لفتح القائمة
 
 ## Notes
 
-- The app starts listening automatically when launched.
-- If Live Captions is not running, the overlay shows a warning message.
-- If `OPENAI_API_KEY` is missing/invalid, translation is paused and a warning is shown.
+- يبدأ تلقائيًا بدون خطوات إضافية.
+- لو `DEEPGRAM_API_KEY` مش موجود، هيظهر تحذير واضح.
+- الأداء سريع لأن التحويل الصوتي Realtime + ترجمة مباشرة مع كاش.

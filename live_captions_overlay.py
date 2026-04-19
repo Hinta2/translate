@@ -1,27 +1,32 @@
 """
-Windows Live Captions -> Arabic Overlay Translator
+Live System-Audio Captions -> Arabic Overlay (Windows)
 
-Features:
-- Reads text from the Windows "Live captions" window using UI Automation (pywinauto).
-- Detects newly appearing caption segments and only translates new content.
-- Translates English captions to Arabic using OpenAI API.
-- Displays Arabic text in a draggable, transparent, always-on-top overlay.
-- Global hotkeys:
-    Ctrl+Shift+T -> Toggle overlay visibility
-    Ctrl+Shift+C -> Clear translated text
-- Starts listening automatically on launch.
+What it does:
+- Captures any audio playing on your computer (WASAPI loopback).
+- Streams audio to Deepgram in real-time for fast English transcription.
+- Translates English transcript to Arabic.
+- Displays Arabic text in a sleek, transparent, always-on-top overlay.
 
-Requirements:
-    pip install openai pywinauto keyboard pywin32
+Hotkeys:
+- Ctrl+Shift+T : Toggle overlay visibility
+- Ctrl+Shift+C : Clear text
+- Ctrl+Shift+= : Increase size
+- Ctrl+Shift+- : Decrease size
 
-Run:
-    set OPENAI_API_KEY=your_key_here
-    python live_captions_overlay.py
+Environment variables:
+- DEEPGRAM_API_KEY (required)
+- DG_MODEL (optional, default: nova-2)
+- CAPTION_ALPHA (optional, default: 0.72)
+
+Dependencies:
+    pip install sounddevice websockets keyboard deep-translator pywin32
 """
 
 from __future__ import annotations
 
+import asyncio
 import ctypes
+import json
 import os
 import queue
 import re
@@ -31,45 +36,50 @@ import tkinter as tk
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 from tkinter import messagebox
+from urllib.parse import urlencode
+
+import sounddevice as sd
+import websockets
+from deep_translator import GoogleTranslator
 
 try:
-    import keyboard  # global hotkeys
-except Exception:  # optional fallback
+    import keyboard
+except Exception:
     keyboard = None
-
-from openai import OpenAI
-from pywinauto import Desktop
 
 
 # ----------------------------- Configuration ---------------------------------
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-LIVE_CAPTIONS_WINDOW_PATTERNS = (
-    r".*Live captions.*",  # Windows Live Captions
-    r".*Live Caption.*Google Chrome.*",  # Chrome tab/window title variants
-    r".*Google Chrome.*Live Caption.*",
-)
-POLL_INTERVAL_SECONDS = 0.25
-MAX_CHARS_PER_REQUEST = 900
-OVERLAY_ALPHA = 0.65
-FONT = ("Segoe UI", 24, "bold")
-MAX_CACHE_SIZE = 300
-STREAM_MODE = os.getenv("CAPTION_STREAM_MODE", "word")  # "word" or "line"
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "").strip()
+DEEPGRAM_MODEL = os.getenv("DG_MODEL", "nova-2")
+CAPTION_ALPHA = float(os.getenv("CAPTION_ALPHA", "0.72"))
+PUNCT_RE = re.compile(r"\s+")
+
+OVERLAY_BG = "#050505"
+OVERLAY_FG = "#F7F7F7"
+OVERLAY_BORDER = "#2F2F2F"
+BASE_WIDTH = 1050
+BASE_HEIGHT = 280
+BASE_FONT_SIZE = 30
+MIN_FONT_SIZE = 16
+MAX_FONT_SIZE = 54
+WRAP_MARGIN = 40
+
+MAX_LINES = 8
+MAX_CACHE_SIZE = 500
+TRANSLATE_MIN_LEN = 1
+UI_POLL_MS = 70
 
 
 # ----------------------------- Data structures --------------------------------
 @dataclass
-class CaptionEvent:
-    """Represents a newly detected caption segment."""
-
+class TranscriptEvent:
     text: str
-    timestamp: float
+    is_final: bool
+    ts: float
 
 
 class LRUCache:
-    """Simple fixed-size LRU cache for recent translations."""
-
-    def __init__(self, max_size: int = 300):
+    def __init__(self, max_size: int = 500):
         self.max_size = max_size
         self._store: OrderedDict[str, str] = OrderedDict()
         self._lock = threading.Lock()
@@ -89,172 +99,265 @@ class LRUCache:
                 self._store.popitem(last=False)
 
 
-# ------------------------ Live Captions extraction ----------------------------
-class LiveCaptionsReader:
-    """Reads current text from a captions window via UI Automation."""
+# ------------------------------ Audio capture ---------------------------------
+class LoopbackAudioSource:
+    """Capture system output audio via Windows WASAPI loopback."""
 
-    def __init__(self, title_patterns: tuple[str, ...] = LIVE_CAPTIONS_WINDOW_PATTERNS):
-        self.title_patterns = title_patterns
+    def __init__(self):
+        self.stream: sd.RawInputStream | None = None
+        self.device = self._pick_loopback_device()
+        self.samplerate = int(self.device.get("default_samplerate", 48000) or 48000)
+        self.channels = min(2, max(1, int(self.device.get("max_output_channels", 2) or 2)))
 
     @staticmethod
-    def _normalize(text: str) -> str:
-        text = text.replace("\u200f", " ").replace("\u200e", " ")
-        text = re.sub(r"\s+", " ", text).strip()
-        return text
+    def _pick_loopback_device() -> dict:
+        devices = sd.query_devices()
+        hostapis = sd.query_hostapis()
 
-    def get_current_text(self) -> str | None:
-        """
-        Returns full current caption text from the Live Captions window.
-        Returns None when the window is not found.
-        """
+        wasapi_index = None
+        for idx, api in enumerate(hostapis):
+            if "WASAPI" in api["name"].upper():
+                wasapi_index = idx
+                break
+
+        if wasapi_index is None:
+            raise RuntimeError("WASAPI host API not found. Windows system-audio capture requires WASAPI.")
+
+        default_out = sd.default.device[1]
+        if default_out is not None and default_out >= 0:
+            d = dict(devices[default_out])
+            if d.get("hostapi") == wasapi_index and d.get("max_output_channels", 0) > 0:
+                return d
+
+        for d in devices:
+            if d.get("hostapi") == wasapi_index and d.get("max_output_channels", 0) > 0:
+                return dict(d)
+
+        raise RuntimeError("No suitable WASAPI output device found for loopback capture.")
+
+    def open(self, callback):
+        wasapi = sd.WasapiSettings(loopback=True)
+        self.stream = sd.RawInputStream(
+            samplerate=self.samplerate,
+            blocksize=0,
+            device=self.device["name"],
+            channels=self.channels,
+            dtype="int16",
+            latency="low",
+            extra_settings=wasapi,
+            callback=callback,
+        )
+        self.stream.start()
+
+    def close(self):
+        if self.stream is not None:
+            try:
+                self.stream.stop()
+                self.stream.close()
+            finally:
+                self.stream = None
+
+
+# ------------------------------ Deepgram client -------------------------------
+class DeepgramStreamer:
+    def __init__(self, api_key: str, model: str):
+        self.api_key = api_key
+        self.model = model
+        self.audio_source = LoopbackAudioSource()
+        self.audio_queue: asyncio.Queue[bytes] | None = None
+        self.stop_event = threading.Event()
+
+    def _build_ws_url(self) -> str:
+        params = {
+            "model": self.model,
+            "language": "en-US",
+            "smart_format": "true",
+            "interim_results": "true",
+            "endpointing": "300",
+            "punctuate": "true",
+            "encoding": "linear16",
+            "channels": str(self.audio_source.channels),
+            "sample_rate": str(self.audio_source.samplerate),
+        }
+        return f"wss://api.deepgram.com/v1/listen?{urlencode(params)}"
+
+    async def run(self, transcript_cb, warning_cb):
+        self.audio_queue = asyncio.Queue(maxsize=60)
+        ws_url = self._build_ws_url()
+
+        def on_audio(indata, _frames, _time_info, status):
+            if status:
+                warning_cb(f"Audio status: {status}")
+            if self.audio_queue is None:
+                return
+            chunk = bytes(indata)
+            try:
+                self.audio_queue.put_nowait(chunk)
+            except asyncio.QueueFull:
+                pass
+
+        self.audio_source.open(on_audio)
+
+        headers = {"Authorization": f"Token {self.api_key}"}
         try:
-            window = self._find_caption_window()
-            if window is None:
-                return None
+            async with websockets.connect(ws_url, additional_headers=headers, max_size=4_000_000) as ws:
+                sender = asyncio.create_task(self._send_audio(ws))
+                receiver = asyncio.create_task(self._recv_transcripts(ws, transcript_cb, warning_cb))
+                done, pending = await asyncio.wait(
+                    [sender, receiver], return_when=asyncio.FIRST_EXCEPTION
+                )
+                for task in pending:
+                    task.cancel()
+                for task in done:
+                    exc = task.exception()
+                    if exc:
+                        raise exc
+        finally:
+            self.audio_source.close()
 
-            texts: list[str] = []
+    async def _send_audio(self, ws):
+        assert self.audio_queue is not None
+        while not self.stop_event.is_set():
+            try:
+                chunk = await asyncio.wait_for(self.audio_queue.get(), timeout=0.25)
+            except asyncio.TimeoutError:
+                continue
+            await ws.send(chunk)
 
-            # Collect text-like descendants; Live Captions typically exposes Text controls.
-            for ctrl in window.descendants(control_type="Text"):
-                val = ctrl.window_text().strip()
-                if val:
-                    texts.append(val)
+    async def _recv_transcripts(self, ws, transcript_cb, warning_cb):
+        while not self.stop_event.is_set():
+            raw = await ws.recv()
+            if isinstance(raw, bytes):
+                continue
 
-            # Fallback in case control types differ.
-            if not texts:
-                for raw in window.texts():
-                    val = raw.strip()
-                    if val:
-                        texts.append(val)
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
 
-            cleaned = self._normalize(" ".join(dict.fromkeys(texts)))
-            return cleaned or ""
-        except Exception:
-            return None
+            if msg.get("type") == "Results":
+                channel = msg.get("channel", {})
+                alts = channel.get("alternatives", [])
+                if not alts:
+                    continue
 
-    def _find_caption_window(self):
-        desktop = Desktop(backend="uia")
-        for pattern in self.title_patterns:
-            window = desktop.window(title_re=pattern)
-            if window.exists(timeout=0.15):
-                return window
-        return None
+                text = (alts[0].get("transcript") or "").strip()
+                if not text:
+                    continue
+
+                is_final = bool(msg.get("is_final", False))
+                transcript_cb(TranscriptEvent(text=text, is_final=is_final, ts=time.time()))
+            elif msg.get("type") == "Metadata":
+                continue
+            elif msg.get("type") == "Warning":
+                warning_cb(msg.get("description", "Deepgram warning."))
 
 
 # ------------------------------ Translator ------------------------------------
-class OpenAITranslator:
-    """Translates English caption segments into Arabic."""
+class ArabicTranslator:
+    """Fast translation with a tiny cache, optimized for streaming text."""
 
-    def __init__(self, api_key: str, model: str = OPENAI_MODEL):
-        self.client = OpenAI(api_key=api_key)
-        self.model = model
+    def __init__(self):
+        self.cache = LRUCache(MAX_CACHE_SIZE)
+        self.translator = GoogleTranslator(source="en", target="ar")
 
-    def translate_to_arabic(self, text: str) -> str:
-        """Translate text with low-latency settings."""
-        response = self.client.responses.create(
-            model=self.model,
-            input=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Translate spoken English captions to clear Modern Standard Arabic. "
-                        "Keep it concise, natural, and do not add explanations."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": text,
-                },
-            ],
-            max_output_tokens=350,
-            temperature=0.2,
-        )
-        return (response.output_text or "").strip()
+    @staticmethod
+    def normalize(text: str) -> str:
+        return PUNCT_RE.sub(" ", text).strip()
+
+    def to_arabic(self, text: str) -> str:
+        cleaned = self.normalize(text)
+        if len(cleaned) < TRANSLATE_MIN_LEN:
+            return ""
+
+        cached = self.cache.get(cleaned)
+        if cached is not None:
+            return cached
+
+        result = self.translator.translate(cleaned) or ""
+        result = result.strip()
+        if result:
+            self.cache.set(cleaned, result)
+        return result
 
 
 # ------------------------------ Overlay UI ------------------------------------
 class OverlayApp:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("Arabic Live Captions Overlay")
-        self.root.overrideredirect(True)  # borderless
+        self.root.title("Live Arabic Captions Overlay")
+        self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
-        self.root.attributes("-alpha", OVERLAY_ALPHA)
-        self.root.configure(bg="black")
-        self.root.geometry("1000x260+180+740")
+        self.root.attributes("-alpha", CAPTION_ALPHA)
+        self.root.configure(bg=OVERLAY_BORDER)
+        self.root.geometry(f"{BASE_WIDTH}x{BASE_HEIGHT}+160+760")
 
-        # Draggable state
+        self.font_size = BASE_FONT_SIZE
+        self.overlay_visible = True
+        self.click_through = False
+
         self._drag_x = 0
         self._drag_y = 0
 
-        # Threading and queues
         self.stop_event = threading.Event()
-        self.capture_queue: queue.Queue[CaptionEvent] = queue.Queue(maxsize=120)
-        self.ui_queue: queue.Queue[tuple[str, str]] = queue.Queue(maxsize=120)
+        self.transcript_queue: queue.Queue[TranscriptEvent] = queue.Queue(maxsize=160)
+        self.ui_queue: queue.Queue[tuple[str, str]] = queue.Queue(maxsize=160)
+        self.lines = deque(maxlen=MAX_LINES)
 
-        # Workers / state
-        self.reader = LiveCaptionsReader()
-        self.overlay_visible = True
-        self.translation_cache = LRUCache(MAX_CACHE_SIZE)
-        self.translated_lines = deque(maxlen=7)
-        self.sent_segments = deque(maxlen=300)
-        self.last_full_text = ""
-        self.last_tokens: list[str] = []
-        self.last_warning_time = 0.0
+        self.translator = ArabicTranslator()
+        self.last_rendered_text = ""
 
-        # Translator setup
-        self.translator: OpenAITranslator | None = None
-        if OPENAI_API_KEY:
-            try:
-                self.translator = OpenAITranslator(OPENAI_API_KEY, OPENAI_MODEL)
-            except Exception:
-                self.translator = None
+        self.deepgram = DeepgramStreamer(DEEPGRAM_API_KEY, DEEPGRAM_MODEL) if DEEPGRAM_API_KEY else None
 
-        # Main text label
-        self.text_var = tk.StringVar(value="Starting listener...")
+        # outer frame for comfy styling
+        self.frame = tk.Frame(self.root, bg=OVERLAY_BG, highlightbackground=OVERLAY_BORDER, highlightthickness=2)
+        self.frame.pack(fill="both", expand=True, padx=2, pady=2)
+
+        self.text_var = tk.StringVar(value="جاهز. شغّل أي صوت إنجليزي وسأعرض الترجمة هنا.")
         self.label = tk.Label(
-            self.root,
+            self.frame,
             textvariable=self.text_var,
-            bg="black",
-            fg="white",
-            font=FONT,
-            justify="left",
-            anchor="sw",
-            padx=22,
-            pady=16,
-            wraplength=960,
+            bg=OVERLAY_BG,
+            fg=OVERLAY_FG,
+            font=("Segoe UI", self.font_size, "bold"),
+            justify="right",
+            anchor="se",
+            padx=18,
+            pady=14,
+            wraplength=BASE_WIDTH - WRAP_MARGIN,
         )
         self.label.pack(fill="both", expand=True)
 
-        # Mouse drag handlers
-        self.label.bind("<ButtonPress-1>", self._start_drag)
-        self.label.bind("<B1-Motion>", self._do_drag)
-
-        # Right-click menu
-        self.menu = tk.Menu(self.root, tearoff=0)
-        self.menu.add_command(label="Clear text", command=self.clear_text)
-        self.menu.add_command(label="Toggle overlay", command=self.toggle_overlay)
-        self.menu.add_command(label="Toggle click-through", command=self.toggle_click_through)
-        self.menu.add_separator()
-        self.menu.add_command(label="Exit", command=self.shutdown)
-        self.label.bind("<Button-3>", self._open_menu)
-
-        # Fallback local hotkeys (work when app has focus)
-        self.root.bind_all("<F8>", lambda _e: self.toggle_overlay())
-        self.root.bind_all("<F9>", lambda _e: self.clear_text())
-
-        # WM cleanup
-        self.root.protocol("WM_DELETE_WINDOW", self.shutdown)
-
-        self.click_through = False
-        self._set_click_through(False)
+        self._bind_events()
         self._register_global_hotkeys()
-
-        # Auto-start workers
+        self._set_click_through(False)
         self._start_threads()
         self._poll_ui_queue()
 
-    # ---------------- UI helpers ----------------
+    def _bind_events(self):
+        self.label.bind("<ButtonPress-1>", self._start_drag)
+        self.label.bind("<B1-Motion>", self._do_drag)
+        self.label.bind("<Button-3>", self._open_menu)
+        self.label.bind("<Control-MouseWheel>", self._on_ctrl_wheel)
+
+        self.root.bind_all("<F8>", lambda _e: self.toggle_overlay())
+        self.root.bind_all("<F9>", lambda _e: self.clear_text())
+        self.root.bind_all("<Control-plus>", lambda _e: self.increase_size())
+        self.root.bind_all("<Control-minus>", lambda _e: self.decrease_size())
+
+        self.menu = tk.Menu(self.root, tearoff=0)
+        self.menu.add_command(label="تكبير", command=self.increase_size)
+        self.menu.add_command(label="تصغير", command=self.decrease_size)
+        self.menu.add_command(label="مسح النص", command=self.clear_text)
+        self.menu.add_separator()
+        self.menu.add_command(label="إخفاء / إظهار", command=self.toggle_overlay)
+        self.menu.add_command(label="Click-through", command=self.toggle_click_through)
+        self.menu.add_separator()
+        self.menu.add_command(label="خروج", command=self.shutdown)
+
+        self.root.protocol("WM_DELETE_WINDOW", self.shutdown)
+
+    # ---------------- UI actions ----------------
     def _start_drag(self, event):
         self._drag_x = event.x
         self._drag_y = event.y
@@ -267,14 +370,39 @@ class OverlayApp:
     def _open_menu(self, event):
         self.menu.tk_popup(event.x_root, event.y_root)
 
-    def append_translated_text(self, text: str):
+    def _on_ctrl_wheel(self, event):
+        if event.delta > 0:
+            self.increase_size()
+        else:
+            self.decrease_size()
+
+    def increase_size(self):
+        self._resize(+2)
+
+    def decrease_size(self):
+        self._resize(-2)
+
+    def _resize(self, delta: int):
+        self.font_size = max(MIN_FONT_SIZE, min(MAX_FONT_SIZE, self.font_size + delta))
+        width = BASE_WIDTH + (self.font_size - BASE_FONT_SIZE) * 14
+        height = BASE_HEIGHT + (self.font_size - BASE_FONT_SIZE) * 5
+        width = max(740, min(1460, width))
+        height = max(180, min(520, height))
+        self.root.geometry(f"{width}x{height}+{self.root.winfo_x()}+{self.root.winfo_y()}")
+        self.label.configure(font=("Segoe UI", self.font_size, "bold"), wraplength=width - WRAP_MARGIN)
+
+    def append_line(self, text: str):
         if not text:
             return
-        self.translated_lines.append(text)
-        self.text_var.set("\n".join(self.translated_lines))
+        if text == self.last_rendered_text:
+            return
+        self.lines.append(text)
+        self.last_rendered_text = text
+        self.text_var.set("\n".join(self.lines))
 
     def clear_text(self):
-        self.translated_lines.clear()
+        self.lines.clear()
+        self.last_rendered_text = ""
         self.text_var.set("")
 
     def toggle_overlay(self):
@@ -291,7 +419,6 @@ class OverlayApp:
         self._set_click_through(self.click_through)
 
     def _set_click_through(self, enabled: bool):
-        """Enable/disable click-through on Windows by modifying extended styles."""
         try:
             hwnd = self.root.winfo_id()
             GWL_EXSTYLE = -20
@@ -310,157 +437,8 @@ class OverlayApp:
             pass
 
     # ---------------- workers ----------------
-    def _start_threads(self):
-        threading.Thread(target=self._capture_loop, daemon=True).start()
-        threading.Thread(target=self._translate_loop, daemon=True).start()
-
-    def _capture_loop(self):
-        while not self.stop_event.is_set():
-            full_text = self.reader.get_current_text()
-
-            if full_text is None:
-                now = time.time()
-                if now - self.last_warning_time > 5:
-                    self.ui_queue.put(
-                        (
-                            "warning",
-                            "Caption window not detected. Open Windows Live Captions or Chrome Live Caption.",
-                        )
-                    )
-                    self.last_warning_time = now
-                time.sleep(POLL_INTERVAL_SECONDS)
-                continue
-
-            new_segment = self._extract_new_segment(self.last_full_text, full_text)
-            self.last_full_text = full_text
-
-            if STREAM_MODE == "word":
-                for token in self._extract_new_tokens(full_text):
-                    if token and token not in self.sent_segments:
-                        self.sent_segments.append(token)
-                        try:
-                            self.capture_queue.put_nowait(CaptionEvent(text=token, timestamp=time.time()))
-                        except queue.Full:
-                            pass
-            elif new_segment:
-                segment = new_segment.strip()
-                if segment and segment not in self.sent_segments:
-                    self.sent_segments.append(segment)
-                    try:
-                        self.capture_queue.put_nowait(CaptionEvent(text=segment, timestamp=time.time()))
-                    except queue.Full:
-                        pass
-
-            time.sleep(POLL_INTERVAL_SECONDS)
-
-    @staticmethod
-    def _extract_new_segment(previous: str, current: str) -> str:
-        """Best-effort extraction of newly appended text."""
-        if not current:
-            return ""
-        if not previous:
-            return current
-
-        if current.startswith(previous):
-            return current[len(previous) :].strip()
-
-        # If captions rolled/reflowed, take unseen tail lines.
-        prev_tokens = previous.split(" ")
-        curr_tokens = current.split(" ")
-
-        # Find longest suffix of previous matching prefix of current.
-        overlap = 0
-        max_k = min(len(prev_tokens), len(curr_tokens), 22)
-        for k in range(max_k, 0, -1):
-            if prev_tokens[-k:] == curr_tokens[:k]:
-                overlap = k
-                break
-
-        tail = " ".join(curr_tokens[overlap:]).strip()
-        if tail == current.strip():
-            # No meaningful overlap detected; avoid massive repeat bursts.
-            if len(current) < 140:
-                return current.strip()
-            return ""
-        return tail
-
-    def _extract_new_tokens(self, current: str) -> list[str]:
-        """
-        Word-by-word extraction mode.
-        Returns only newly appended tokens since the last poll.
-        """
-        if not current:
-            self.last_tokens = []
-            return []
-
-        current_tokens = current.split()
-        if not self.last_tokens:
-            self.last_tokens = current_tokens
-            return current_tokens[-3:] if len(current_tokens) > 3 else current_tokens
-
-        overlap = 0
-        max_k = min(len(self.last_tokens), len(current_tokens), 18)
-        for k in range(max_k, 0, -1):
-            if self.last_tokens[-k:] == current_tokens[:k]:
-                overlap = k
-                break
-
-        new_tokens = current_tokens[overlap:]
-        self.last_tokens = current_tokens
-
-        # Avoid re-sending huge chunks on reflow; only send a small tail.
-        if len(new_tokens) > 8:
-            return new_tokens[-3:]
-        return new_tokens
-
-    def _translate_loop(self):
-        while not self.stop_event.is_set():
-            try:
-                event = self.capture_queue.get(timeout=0.25)
-            except queue.Empty:
-                continue
-
-            source = event.text[:MAX_CHARS_PER_REQUEST].strip()
-            if not source:
-                continue
-
-            cached = self.translation_cache.get(source)
-            if cached is not None:
-                self.ui_queue.put(("append", cached))
-                continue
-
-            if not self.translator:
-                self.ui_queue.put(("warning", "OPENAI_API_KEY is missing or invalid. Translation paused."))
-                continue
-
-            try:
-                translated = self.translator.translate_to_arabic(source)
-                if translated:
-                    self.translation_cache.set(source, translated)
-                    self.ui_queue.put(("append", translated))
-            except Exception as exc:
-                self.ui_queue.put(("warning", f"Translation API error: {exc}"))
-
-    def _poll_ui_queue(self):
-        while True:
-            try:
-                action, payload = self.ui_queue.get_nowait()
-            except queue.Empty:
-                break
-
-            if action == "append":
-                self.append_translated_text(payload)
-            elif action == "warning":
-                # Show temporary warning in overlay and optional popup when key is missing.
-                if not self.translated_lines:
-                    self.text_var.set(payload)
-
-        self.root.after(80, self._poll_ui_queue)
-
-    # ---------------- hotkeys / lifecycle ----------------
     def _register_global_hotkeys(self):
         if keyboard is None:
-            # fallback only (F8/F9 when window focused)
             return
 
         def _safe_register(hotkey: str, callback):
@@ -471,17 +449,82 @@ class OverlayApp:
 
         _safe_register("ctrl+shift+t", self.toggle_overlay)
         _safe_register("ctrl+shift+c", self.clear_text)
+        _safe_register("ctrl+shift+=", self.increase_size)
+        _safe_register("ctrl+shift+-", self.decrease_size)
+
+    def _start_threads(self):
+        threading.Thread(target=self._translator_loop, daemon=True).start()
+        if self.deepgram is None:
+            self.ui_queue.put(("warning", "DEEPGRAM_API_KEY غير موجود. ضعه ثم أعد التشغيل."))
+            return
+        threading.Thread(target=self._deepgram_thread, daemon=True).start()
+
+    def _deepgram_thread(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        def on_transcript(event: TranscriptEvent):
+            if event.is_final:
+                try:
+                    self.transcript_queue.put_nowait(event)
+                except queue.Full:
+                    pass
+
+        def on_warning(msg: str):
+            try:
+                self.ui_queue.put_nowait(("warning", msg))
+            except queue.Full:
+                pass
+
+        try:
+            loop.run_until_complete(self.deepgram.run(on_transcript, on_warning))
+        except Exception as exc:
+            self.ui_queue.put(("warning", f"Deepgram error: {exc}"))
+        finally:
+            loop.stop()
+            loop.close()
+
+    def _translator_loop(self):
+        while not self.stop_event.is_set():
+            try:
+                event = self.transcript_queue.get(timeout=0.25)
+            except queue.Empty:
+                continue
+
+            try:
+                translated = self.translator.to_arabic(event.text)
+                if translated:
+                    self.ui_queue.put(("append", translated))
+            except Exception as exc:
+                self.ui_queue.put(("warning", f"Translation error: {exc}"))
+
+    def _poll_ui_queue(self):
+        while True:
+            try:
+                action, payload = self.ui_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            if action == "append":
+                self.append_line(payload)
+            elif action == "warning":
+                if not self.lines:
+                    self.text_var.set(payload)
+
+        self.root.after(UI_POLL_MS, self._poll_ui_queue)
 
     def run(self):
-        if not OPENAI_API_KEY:
+        if not DEEPGRAM_API_KEY:
             messagebox.showwarning(
                 "Missing API Key",
-                "OPENAI_API_KEY is not set.\nSet your key, then restart for translation to work.",
+                "DEEPGRAM_API_KEY is not set. Add it and restart.",
             )
         self.root.mainloop()
 
     def shutdown(self):
         self.stop_event.set()
+        if self.deepgram is not None:
+            self.deepgram.stop_event.set()
         try:
             if keyboard is not None:
                 keyboard.unhook_all_hotkeys()
@@ -490,7 +533,6 @@ class OverlayApp:
         self.root.destroy()
 
 
-# ------------------------------ Entrypoint ------------------------------------
 if __name__ == "__main__":
     app = OverlayApp()
     app.run()
