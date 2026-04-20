@@ -64,6 +64,31 @@ def _pick_wasapi_output_device() -> int | None:
     return None
 
 
+def _pick_matching_loopback_input(output_device: int) -> int | None:
+    """
+    Fallback for older sounddevice/PortAudio builds that don't support
+    RawInputStream(loopback=True). In those cases, a dedicated loopback input
+    device may exist and can be opened like a normal input.
+    """
+    try:
+        output_info = sd.query_devices(output_device)
+        output_name = str(output_info.get("name", "")).lower()
+        output_hostapi = output_info.get("hostapi")
+
+        for idx, dev in enumerate(sd.query_devices()):
+            if dev.get("max_input_channels", 0) <= 0:
+                continue
+            if output_hostapi is not None and dev.get("hostapi") != output_hostapi:
+                continue
+
+            name = str(dev.get("name", "")).lower()
+            if "loopback" in name and (not output_name or output_name.split("(")[0].strip() in name):
+                return idx
+    except Exception:
+        return None
+    return None
+
+
 def start_audio_capture() -> None:
     """Start audio capture in background thread (mic or system loopback)."""
     global shared_samplerate
@@ -80,22 +105,36 @@ def start_audio_capture() -> None:
         shared_samplerate = int(info.get("default_samplerate", 48000))
 
         print(f"🎧 Capturing SYSTEM audio (loopback) from: {info.get('name', output_device)}")
-        with sd.RawInputStream(
+        stream_kwargs = dict(
             samplerate=shared_samplerate,
             blocksize=BLOCKSIZE,
-            device=output_device,
             channels=CHANNELS,
             dtype="int16",
-            # NOTE:
-            # loopback is a RawInputStream argument, not a WasapiSettings argument.
-            # Putting it on WasapiSettings raises:
-            # TypeError: WasapiSettings.__init__() got an unexpected keyword argument 'loopback'
-            loopback=True,
-            extra_settings=sd.WasapiSettings(),
             callback=lambda indata, frames, time_info, status: _push_audio(bytes(indata), status),
-        ):
-            while True:
-                sd.sleep(1000)
+        )
+
+        try:
+            # Newer sounddevice versions: capture output device directly with loopback=True.
+            with sd.RawInputStream(device=output_device, loopback=True, **stream_kwargs):
+                while True:
+                    sd.sleep(1000)
+        except TypeError as exc:
+            # Older sounddevice versions may not support the loopback argument.
+            if "loopback" not in str(exc).lower():
+                raise
+
+            loopback_input = _pick_matching_loopback_input(output_device)
+            if loopback_input is None:
+                raise RuntimeError(
+                    "This sounddevice build does not support loopback=True and no loopback input "
+                    "device was found. Update sounddevice or set AUDIO_SOURCE_MODE=mic."
+                ) from exc
+
+            fallback_info = sd.query_devices(loopback_input)
+            print(f"🎧 Fallback loopback input device: {fallback_info.get('name', loopback_input)}")
+            with sd.RawInputStream(device=loopback_input, **stream_kwargs):
+                while True:
+                    sd.sleep(1000)
 
     else:
         mic_device = _pick_microphone_device()
