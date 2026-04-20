@@ -105,12 +105,12 @@ class LoopbackAudioSource:
 
     def __init__(self):
         self.stream: sd.RawInputStream | None = None
-        self.device = self._pick_loopback_device()
+        self.device_index, self.device = self._pick_loopback_device()
         self.samplerate = int(self.device.get("default_samplerate", 48000) or 48000)
         self.channels = min(2, max(1, int(self.device.get("max_output_channels", 2) or 2)))
 
     @staticmethod
-    def _pick_loopback_device() -> dict:
+    def _pick_loopback_device() -> tuple[int, dict]:
         devices = sd.query_devices()
         hostapis = sd.query_hostapis()
 
@@ -127,20 +127,22 @@ class LoopbackAudioSource:
         if default_out is not None and default_out >= 0:
             d = dict(devices[default_out])
             if d.get("hostapi") == wasapi_index and d.get("max_output_channels", 0) > 0:
-                return d
+                return int(default_out), d
 
-        for d in devices:
+        for idx, d in enumerate(devices):
             if d.get("hostapi") == wasapi_index and d.get("max_output_channels", 0) > 0:
-                return dict(d)
+                return idx, dict(d)
 
         raise RuntimeError("No suitable WASAPI output device found for loopback capture.")
 
     def open(self, callback):
         wasapi = sd.WasapiSettings(loopback=True)
+        # Important: use the output-device index (not input/mic) with loopback=True.
+        # Passing a name string can resolve ambiguously on some machines and may capture mic.
         self.stream = sd.RawInputStream(
             samplerate=self.samplerate,
             blocksize=0,
-            device=self.device["name"],
+            device=self.device_index,
             channels=self.channels,
             dtype="int16",
             latency="low",

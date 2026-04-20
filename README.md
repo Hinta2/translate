@@ -5,6 +5,7 @@
 ## Features
 
 - يلتقط صوت النظام بالكامل (System Audio / Speaker Output) عبر WASAPI Loopback.
+- لا يلتقط الميكروفون (Mic) نهائيًا؛ الالتقاط من الـ Speaker/Output فقط.
 - يحول الكلام الإنجليزي إلى نص بسرعة باستخدام Deepgram Realtime.
 - يترجم النص للعربي تلقائيًا ويعرضه على Overlay عائم دائمًا فوق كل النوافذ.
 - Overlay قابل للسحب + تكبير/تصغير سريع.
