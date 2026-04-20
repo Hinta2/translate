@@ -86,7 +86,12 @@ def start_audio_capture() -> None:
             device=output_device,
             channels=CHANNELS,
             dtype="int16",
-            extra_settings=sd.WasapiSettings(loopback=True),
+            # NOTE:
+            # loopback is a RawInputStream argument, not a WasapiSettings argument.
+            # Putting it on WasapiSettings raises:
+            # TypeError: WasapiSettings.__init__() got an unexpected keyword argument 'loopback'
+            loopback=True,
+            extra_settings=sd.WasapiSettings(),
             callback=lambda indata, frames, time_info, status: _push_audio(bytes(indata), status),
         ):
             while True:
